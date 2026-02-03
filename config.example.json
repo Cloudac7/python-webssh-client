@@ -1,0 +1,10 @@
+{
+  "type": "connect",
+  "message": {
+    "room": "",
+    "account": "",
+    "stoken": "",
+    "userId": "",
+    "token": ""
+  }
+}
