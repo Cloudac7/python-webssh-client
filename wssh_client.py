@@ -41,6 +41,7 @@ AUTH_PAYLOAD = None
 is_running = True
 ws_global = None
 debug_mode = False
+last_terminal_size = None  # 跟踪上次发送的终端大小，避免重复发送
 
 # ===========================================
 
@@ -67,22 +68,42 @@ def load_auth_from_string(auth_json_str):
         sys.exit(1)
 
 def get_terminal_size():
-    try:
-        s = struct.pack("HHHH", 0, 0, 0, 0)
-        t = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, s)
-        h, w, hp, wp = struct.unpack("HHHH", t)
-        return w, h
-    except:
-        return 80, 24
+    """
+    获取终端大小，通过多个文件描述符尝试
+    尝试顺序: stdin(0) -> stdout(1) -> stderr(2)
+    """
+    for fd in [sys.stdin.fileno(), sys.stdout.fileno(), sys.stderr.fileno()]:
+        try:
+            s = struct.pack("HHHH", 0, 0, 0, 0)
+            t = fcntl.ioctl(fd, termios.TIOCGWINSZ, s)
+            h, w, hp, wp = struct.unpack("HHHH", t)
+            if w > 0 and h > 0:  # 确保获取到有效的大小
+                logger.debug(f"Got terminal size from fd {fd}: {w}x{h}")
+                return w, h
+        except Exception as e:
+            logger.debug(f"Failed to get terminal size from fd {fd}: {e}")
+            continue
+    
+    # 如果所有尝试都失败，返回默认值并记录警告
+    logger.warning("Failed to get terminal size from all file descriptors, using default 80x24")
+    return 80, 24
 
 def send_resize():
+    global last_terminal_size, ws_global
     if not ws_global or not ws_global.sock or not ws_global.sock.connected:
         return
     cols, rows = get_terminal_size()
+    
+    # 避免重复发送相同的大小，但允许发送变化后的大小
+    if last_terminal_size == (cols, rows):
+        logger.debug(f"Terminal size unchanged: {cols}x{rows}, skipping resize")
+        return
+    
     # ⚠️ 保持之前的 Resize 格式
     payload = { "type": "resize", "message": { "cols": cols, "rows": rows } }
     try:
         ws_global.send(json.dumps(payload))
+        last_terminal_size = (cols, rows)
         logger.debug(f"Sent resize: {cols}x{rows}")
     except Exception as e:
         logger.debug(f"Failed to send resize: {e}")
@@ -112,10 +133,9 @@ def on_message(ws, message):
         # 检测服务器的成功响应或初始 Shell 提示，立即同步窗口大小
         if msg_type in ["connected", "ready"] or (isinstance(content, str) and content.strip() and "logout" not in content.lower()):
             # 在认证完成、准备就绪时立即发送窗口大小
-            if not hasattr(on_message, 'resize_sent'):
-                time.sleep(0.05)  # 给服务器很短的时间初始化
-                send_resize()
-                on_message.resize_sent = True
+            # 使用 send_resize() 内部的逻辑来避免重复发送
+            time.sleep(0.05)  # 给服务器很短的时间初始化
+            send_resize()
         
         # ------------------------------------------------
         # 修复 2: 自动检测 "logout" 关键字
@@ -156,9 +176,10 @@ def on_close(ws, close_status_code, close_msg):
     is_running = False
 
 def on_open(ws):
-    global ws_global
+    global ws_global, last_terminal_size
     ws_global = ws
     cols, rows = get_terminal_size()
+    last_terminal_size = (cols, rows)
     logger.info(f"WebSocket connected. Local terminal size: {cols}x{rows}")
     
     # 立即发送认证
@@ -233,6 +254,11 @@ if __name__ == "__main__":
     
     # 配置日志
     setup_logger(debug_mode)
+    
+    # 初始化终端大小
+    cols, rows = get_terminal_size()
+    last_terminal_size = (cols, rows)
+    logger.debug(f"Initial terminal size: {cols}x{rows}")
     
     # 加载 AUTH_PAYLOAD
     if args.config:
